@@ -1,5 +1,7 @@
 package main
 
+import "errors"
+
 type ErrorCorrectionLevel int
 
 const (
@@ -9,20 +11,30 @@ const (
 	H
 )
 
-func NewQR(data []byte, el ErrorCorrectionLevel) (*QR, error) {
-	version, err := GetLowestQRVersionByte(len(data), el)
+type QR struct {
+	bitmap [][]int
+	meta   *VersionMetaData
+	size   int
+	mode   *ModeIndicator
+}
+
+func NewQR(data []byte, el ErrorCorrectionLevel, dm DataMode) (*QR, error) {
+	qrMeta, err := SmallestQRVersion(len(data), el)
 
 	if err != nil {
 		return nil, err
 	}
-	size := (((version - 1) * 4) + 21)
+	size := (((qrMeta.Version - 1) * 4) + 21)
 
 	bitmap := make([][]int, size)
 	for i := range bitmap {
 		bitmap[i] = make([]int, size)
 	}
-
-	qr := &QR{bitmap, version, size, 0}
+	mode, err := getModeIndicator(dm)
+	if err != nil {
+		return nil, err
+	}
+	qr := &QR{bitmap, qrMeta, size, mode}
 
 	qr.addFinders()
 	qr.addSeparators()
@@ -30,7 +42,48 @@ func NewQR(data []byte, el ErrorCorrectionLevel) (*QR, error) {
 	qr.addTiming()
 	qr.addReserved()
 	qr.addModule()
+	indicator, err := qr.getIndicators(data)
+	if err != nil {
+		return nil, err
+	}
+	encodedData, err := qr.encode(data)
+	if err != nil {
+		return nil, err
+	}
+	maxBits := qr.meta.MaxCodewords * 8
+
+	encodedData = append(indicator, encodedData...)
+	for i := 0; len(encodedData) < maxBits && i < 4; i++ {
+		encodedData = append(encodedData, BLACK)
+	}
+	for len(encodedData)%8 != 0 {
+		encodedData = append(encodedData, BLACK)
+	}
+
+	pad236 := []int{WHITE, WHITE, WHITE, BLACK, WHITE, WHITE, BLACK, BLACK}
+	pad7 := []int{BLACK, BLACK, BLACK, WHITE, BLACK, BLACK, BLACK, WHITE}
+
+	for i := false; len(encodedData) < maxBits; i = !i {
+		if i {
+			encodedData = append(encodedData, pad236...)
+		} else {
+			encodedData = append(encodedData, pad7...)
+		}
+
+	}
+	err = qr.addEncodedData(encodedData)
+	if err != nil {
+		return nil, err
+	}
 	return qr, nil
+}
+
+func (qr *QR) encode(data []byte) ([]int, error) {
+
+	if qr.mode.Mode == Byte {
+		return byteEncode(data), nil
+	}
+	return []int{}, errors.New("No encoding mode set")
 }
 
 func (qr *QR) addFinders() {
@@ -50,7 +103,7 @@ func (qr *QR) addFinders() {
 		copy(qr.bitmap[y], l)
 	}
 
-	offsett := (((qr.version - 1) * 4) + 21) - 7
+	offsett := (((qr.meta.Version - 1) * 4) + 21) - 7
 	// Add bottom-left finder
 	for y, l := range finderPattern {
 		copy(qr.bitmap[y+offsett], l)
@@ -67,7 +120,7 @@ func (qr *QR) addSeparators() {
 
 	offsett := 7
 
-	offsett2 := (((qr.version - 1) * 4) + 21) - (offsett + 1)
+	offsett2 := (((qr.meta.Version - 1) * 4) + 21) - (offsett + 1)
 
 	y := 0
 	for i := 0; i < 7; i++ {
@@ -142,11 +195,11 @@ var alignmentMap map[int][]int = map[int][]int{
 }
 
 func (qr *QR) addAlignments() {
-	if qr.version == 1 {
+	if qr.meta.Version == 1 {
 		return
 	}
 
-	alignment := alignmentMap[qr.version]
+	alignment := alignmentMap[qr.meta.Version]
 	alignerPattern := [][]int{
 		{FUNCTION_BLACK, FUNCTION_BLACK, FUNCTION_BLACK, FUNCTION_BLACK, FUNCTION_BLACK},
 		{FUNCTION_BLACK, FUNCTION_WHITE, FUNCTION_WHITE, FUNCTION_WHITE, FUNCTION_BLACK},
@@ -171,7 +224,7 @@ func (qr *QR) addTiming() {
 
 	offsett := 7
 
-	offsett2 := (((qr.version - 1) * 4) + 21) - (offsett + 1)
+	offsett2 := (((qr.meta.Version - 1) * 4) + 21) - (offsett + 1)
 
 	y := 6
 	marker := func(i int) int {
@@ -194,7 +247,7 @@ func (qr *QR) addTiming() {
 
 func (qr *QR) addModule() {
 
-	y := (4 * qr.version) + 9
+	y := (4 * qr.meta.Version) + 9
 	x := 8
 
 	qr.bitmap[y][x] = FUNCTION_BLACK
@@ -202,7 +255,7 @@ func (qr *QR) addModule() {
 
 func (qr *QR) addReserved() {
 
-	offsett := (((qr.version - 1) * 4) + 21) - 8
+	offsett := (((qr.meta.Version - 1) * 4) + 21) - 8
 
 	y := 0
 
@@ -210,7 +263,7 @@ func (qr *QR) addReserved() {
 		if qr.bitmap[y][8] == EMPTY {
 			qr.bitmap[y][8] = RESERVE
 
-			if y < 6 && qr.version != 1 {
+			if y < 6 && qr.meta.Version != 1 {
 				qr.bitmap[y][offsett-3] = RESERVE
 				qr.bitmap[y][offsett-2] = RESERVE
 				qr.bitmap[y][offsett-1] = RESERVE
@@ -230,7 +283,7 @@ func (qr *QR) addReserved() {
 		}
 	}
 
-	for y = offsett - 3; y < offsett && qr.version != 1; y++ {
+	for y = offsett - 3; y < offsett && qr.meta.Version != 1; y++ {
 		for x := 0; x < 6; x++ {
 			qr.bitmap[y][x] = RESERVE
 		}
